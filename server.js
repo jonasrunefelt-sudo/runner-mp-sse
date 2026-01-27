@@ -105,7 +105,13 @@ app.get("/sse", (req, res) => {
 
   // keep-alive ping (viktigt för proxies)
   const ping = setInterval(() => {
-    try { sseSend(res, "ping", { t: nowMs() }); } catch {}
+    try {
+      // ✅ håll spelaren "alive" även om den inte tickar (t.ex. i menyn)
+      const p = track.players.get(cid);
+      if (p) p.ts = nowMs();
+  
+      sseSend(res, "ping", { t: nowMs() });
+    } catch {}
   }, 15000);
 
   req.on("close", () => {
