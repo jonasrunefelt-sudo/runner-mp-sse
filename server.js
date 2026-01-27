@@ -17,7 +17,7 @@ const PORT = process.env.PORT || 3000;
  * }
  */
 const tracks = new Map();
-const TTL_MS = 8000;
+const TTL_MS = 60000;
 
 function nowMs() { return Date.now(); }
 
