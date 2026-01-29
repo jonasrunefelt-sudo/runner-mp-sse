@@ -25,13 +25,14 @@ function nowMs() { return Date.now(); }
 
 function getTrack(trackId) {
   if (!tracks.has(trackId)) {
-    tracks.set(trackId, {
-      players: new Map(),
-      startAtEpochMs: null,
-      sse: new Map(),
-      ws: new Map(),
-      _broadcastTimer: null,
-    });
+	tracks.set(trackId, {
+	  players: new Map(),
+	  startAtEpochMs: null,
+	  winnerCid: null,              // ✅ NYTT
+	  sse: new Map(),
+	  ws: new Map(),
+	  _broadcastTimer: null,
+	});
   }
   return tracks.get(trackId);
 }
@@ -58,10 +59,14 @@ function cleanup(track) {
   }
 
   // Om <2 spelare kvar: nolla start och ready
-  if (track.players.size < 2) {
-    track.startAtEpochMs = null;
-    for (const p of track.players.values()) p.ready = false;
-  }
+	if (track.players.size < 2) {
+	  track.startAtEpochMs = null;
+	  track.winnerCid = null; // ✅ NYTT
+	  for (const p of track.players.values()) {
+		p.ready = false;
+		p.finishedAtEpochMs = null; // ✅ NYTT
+	  }
+	}
 }
 
 function opponentOf(track, cid) {
@@ -112,6 +117,7 @@ function startWsBroadcastLoop(trackId) {
         vy: p.vy || 0,
         ts: p.ts || 0,
         ready: !!p.ready,
+		finishedAtEpochMs: p.finishedAtEpochMs ?? null,
       });
     }
 
@@ -120,6 +126,7 @@ function startWsBroadcastLoop(trackId) {
       track: trackId,
       serverNowMs: t,
       startAtEpochMs: tr.startAtEpochMs,
+	  winnerCid: tr.winnerCid ?? null,
       players,
       playersCount: tr.players.size,
       readyCount,
@@ -159,8 +166,11 @@ function maybeArmStart(tr) {
 
 function resetStart(tr) {
   tr.startAtEpochMs = null;
-  for (const p of tr.players.values()) p.ready = false;
-
+  tr.winnerCid = null; // ✅ NYTT
+  for (const p of tr.players.values()) {
+	p.ready = false;
+    p.finishedAtEpochMs = null; // ✅ NYTT
+  }
   // informera (valfritt)
   for (const res2 of tr.sse.values()) {
     sseSend(res2, "start", { startAtEpochMs: null, serverNowMs: nowMs() });
@@ -186,7 +196,7 @@ app.get("/sse", (req, res) => {
 
   // markera som online
   if (!tr.players.has(cid)) {
-    tr.players.set(cid, { x: 0, y: 0, vx: 0, vy: 0, ts: nowMs(), ready: false });
+    tr.players.set(cid, { x: 0, y: 0, vx: 0, vy: 0, ts: nowMs(), ready: false, finishedAtEpochMs: null });
   } else {
     tr.players.get(cid).ts = nowMs();
   }
@@ -237,7 +247,7 @@ app.post("/tick", (req, res) => {
   cleanup(tr);
 
   if (!tr.players.has(C)) {
-    tr.players.set(C, { x: 0, y: 0, vx: 0, vy: 0, ts: nowMs(), ready: false });
+    tr.players.set(C, { x: 0, y: 0, vx: 0, vy: 0, ts: nowMs(), ready: false, finishedAtEpochMs: null });
   }
 
   const p = tr.players.get(C);
@@ -280,7 +290,7 @@ app.post("/ready", (req, res) => {
   cleanup(tr);
 
   if (!tr.players.has(C)) {
-    tr.players.set(C, { x: 0, y: 0, vx: 0, vy: 0, ts: nowMs(), ready: false });
+    tr.players.set(C, { x: 0, y: 0, vx: 0, vy: 0, ts: nowMs(), ready: false, finishedAtEpochMs: null });
   }
 
   const p = tr.players.get(C);
@@ -317,6 +327,35 @@ app.post("/ready", (req, res) => {
     startAtEpochMs: tr.startAtEpochMs,
     playersCount: tr.players.size
   });
+});
+
+app.post("/finish", (req, res) => {
+  const { track, cid } = req.body || {};
+  if (!track || !cid) return res.status(400).json({ ok: false, err: "missing_track_or_cid" });
+
+  const trackId = String(track);
+  const C = String(cid);
+
+  const tr = getTrack(trackId);
+  cleanup(tr);
+
+  if (!tr.players.has(C)) {
+    tr.players.set(C, { x: 0, y: 0, vx: 0, vy: 0, ts: nowMs(), ready: false, finishedAtEpochMs: null });
+  }
+
+  const p = tr.players.get(C);
+  p.ts = nowMs();
+  if (!Number.isFinite(p.finishedAtEpochMs)) p.finishedAtEpochMs = nowMs();
+  if (!tr.winnerCid) tr.winnerCid = C;
+
+  for (const ws2 of tr.ws.values()) {
+    wsSafeSend(ws2, { type: "finish", cid: C, finishedAtEpochMs: p.finishedAtEpochMs, winnerCid: tr.winnerCid, serverNowMs: nowMs() });
+  }
+  for (const res2 of tr.sse.values()) {
+    sseSend(res2, "finish", { cid: C, finishedAtEpochMs: p.finishedAtEpochMs, winnerCid: tr.winnerCid, serverNowMs: nowMs() });
+  }
+
+  return res.json({ ok: true, winnerCid: tr.winnerCid, finishedAtEpochMs: p.finishedAtEpochMs });
 });
 
 /* =========================
@@ -370,7 +409,7 @@ wss.on("connection", (ws) => {
 
       // register player if not exists
       if (!tr.players.has(cid)) {
-        tr.players.set(cid, { x: 0, y: 0, vx: 0, vy: 0, ts: nowMs(), ready: false });
+        tr.players.set(cid, { x: 0, y: 0, vx: 0, vy: 0, ts: nowMs(), ready: false, finishedAtEpochMs: null });
       } else {
         tr.players.get(cid).ts = nowMs();
       }
@@ -396,7 +435,7 @@ wss.on("connection", (ws) => {
     // UPDATE: {type:"update", x,y,vx,vy}
     if (msg.type === "update") {
       if (!tr.players.has(cid)) {
-        tr.players.set(cid, { x: 0, y: 0, vx: 0, vy: 0, ts: nowMs(), ready: false });
+        tr.players.set(cid, { x: 0, y: 0, vx: 0, vy: 0, ts: nowMs(), ready: false, finishedAtEpochMs: null });
       }
       const p = tr.players.get(cid);
 
@@ -415,7 +454,7 @@ wss.on("connection", (ws) => {
     // READY: {type:"ready", ready:true/false}
     if (msg.type === "ready") {
       if (!tr.players.has(cid)) {
-        tr.players.set(cid, { x: 0, y: 0, vx: 0, vy: 0, ts: nowMs(), ready: false });
+        tr.players.set(cid, { x: 0, y: 0, vx: 0, vy: 0, ts: nowMs(), ready: false, finishedAtEpochMs: null });
       }
       const p = tr.players.get(cid);
       p.ready = !!msg.ready;
@@ -438,6 +477,52 @@ wss.on("connection", (ws) => {
 
       return;
     }
+
+	// FINISH: {type:"finish"}
+	if (msg.type === "finish") {
+	  const tr = getTrack(trackId);
+	  cleanup(tr);
+
+	  if (!tr.players.has(cid)) {
+		tr.players.set(cid, { x: 0, y: 0, vx: 0, vy: 0, ts: nowMs(), ready: false, finishedAtEpochMs: null });
+	  }
+
+	  const p = tr.players.get(cid);
+	  p.ts = nowMs();
+
+	  // ✅ servern avgör tiden (rättvist)
+	  if (!Number.isFinite(p.finishedAtEpochMs)) {
+		p.finishedAtEpochMs = nowMs();
+	  }
+
+	  // ✅ vinnare = första som finishar
+	  if (!tr.winnerCid) {
+		tr.winnerCid = cid;
+	  }
+
+	  // broadcast till alla WS
+	  for (const ws2 of tr.ws.values()) {
+		wsSafeSend(ws2, {
+		  type: "finish",
+		  cid,
+		  finishedAtEpochMs: p.finishedAtEpochMs,
+		  winnerCid: tr.winnerCid,
+		  serverNowMs: nowMs(),
+		});
+	  }
+
+	  // (valfritt) till SSE också
+	  for (const res2 of tr.sse.values()) {
+		sseSend(res2, "finish", {
+		  cid,
+		  finishedAtEpochMs: p.finishedAtEpochMs,
+		  winnerCid: tr.winnerCid,
+		  serverNowMs: nowMs(),
+		});
+	  }
+
+	  return;
+	}
 
     // LEAVE: {type:"leave"}
     if (msg.type === "leave") {
