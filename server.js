@@ -2,6 +2,7 @@ import express from "express";
 import cors from "cors";
 import http from "http";
 import { WebSocketServer } from "ws";
+import { TRACKS } from "./tracks.js";
 
 const app = express();
 app.use(cors()); // OK för test
@@ -74,6 +75,202 @@ function opponentOf(track, cid) {
     if (k !== cid) return { cid: k, p: v };
   }
   return null;
+}
+
+/* =========================
+   Track geometry + finish verify (server-side)
+========================= */
+
+const FINISH_VERIFY_PLAYER_R_W = 16;     // matcha klientens PLAYER_R_W
+const FINISH_VERIFY_EPS_W = 2.5;         // lite tolerans
+
+function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+
+function getTrackDef(trackId) {
+  const t = TRACKS.find(x => String(x.id) === String(trackId));
+  return t || null;
+}
+
+function normalizeSegments(rawSegments) {
+  const out = [];
+  for (const s of (rawSegments || [])) {
+    if (typeof s === "string") {
+      const parts = s.trim().split(/\s+/);
+      const word = parts[0]?.toLowerCase();
+      const val = Number(parts[1]);
+      if (word === "straight") out.push({ type: "line", len: val });
+      continue;
+    }
+    if (!s || typeof s !== "object") continue;
+
+    const t = String(s.type || "").toLowerCase();
+
+    if (t === "straight") { out.push({ type: "line", len: Number(s.len) }); continue; }
+
+    if (t === "left" || t === "right") {
+      const sign = t === "right" ? +1 : -1;
+      const a = (s.a !== undefined)
+        ? sign * Math.abs(Number(s.a))
+        : sign * (Number(s.deg ?? 0) * Math.PI / 180);
+      out.push({ type: "arc", r: Number(s.r), a });
+      continue;
+    }
+
+    if (t === "line") { out.push({ type: "line", len: Number(s.len) }); continue; }
+    if (t === "arc")  { out.push({ type: "arc",  r: Number(s.r), a: Number(s.a) }); continue; }
+  }
+  return out;
+}
+
+function estimateTrackLengthW(track) {
+  const segs = normalizeSegments(track.segments || []);
+  let total = 0;
+  for (const s of segs) {
+    if (s.type === "line") total += Math.max(0, Number(s.len) || 0);
+    else if (s.type === "arc") total += Math.abs(Number(s.a) || 0) * Math.max(0, Number(s.r) || 0);
+  }
+  return total;
+}
+
+// Bygger bara sista mållinje-segmentet (finishX/Y + tangent) på samma sätt som klienten.
+// Returnerar { finishX, finishY, finishTX, finishTY, trackW, worldW, worldH } eller null.
+function buildFinishGeom(trackId) {
+  const def = getTrackDef(trackId);
+  if (!def) return null;
+
+  const WORLD_W = Number(def.worldW || 800);
+  const TRACK_W = Number(def.trackW || 220);
+
+  const baseH = Number(def.worldH || 10000);
+  const estLen = estimateTrackLengthW(def);
+
+  // samma logik som du kör på klienten (legacy + finish-safe)
+  const legacyWorldH = Math.max(baseH, Math.ceil(estLen + 800));
+  const SHIP_OFFSET_W = 1000;     // matcha klientens SHIP_OFFSET_W
+  const FINISH_MARGIN_W = 200;
+  const minWorldHForFinish = estLen + 200 + SHIP_OFFSET_W + FINISH_MARGIN_W;
+  const WORLD_H = Math.max(legacyWorldH, Math.ceil(minWorldHForFinish));
+
+  // === buildTrack() ===
+  const STEP = 10;
+  const segs = normalizeSegments(def.segments || []);
+  const pts = [];
+
+  let x = WORLD_W / 2;
+  let y = WORLD_H - 200;
+  let heading = -Math.PI / 2;
+  pts.push({ x, y });
+
+  function addLine(len) {
+    const n = Math.max(1, Math.floor(len / STEP));
+    const dl = len / n;
+    for (let i = 0; i < n; i++) {
+      x += Math.cos(heading) * dl;
+      y += Math.sin(heading) * dl;
+      pts.push({ x, y });
+    }
+  }
+
+  function addArc(r, a) {
+    const R = Math.max(30, r);
+    const sign = Math.sign(a) || 1;
+    const cx = x + Math.cos(heading + sign * Math.PI / 2) * R;
+    const cy = y + Math.sin(heading + sign * Math.PI / 2) * R;
+    let ang = Math.atan2(y - cy, x - cx);
+
+    const arcLen = Math.abs(a) * R;
+    const n = Math.max(1, Math.floor(arcLen / STEP));
+    const da = a / n;
+
+    for (let i = 0; i < n; i++) {
+      ang += da;
+      x = cx + Math.cos(ang) * R;
+      y = cy + Math.sin(ang) * R;
+      heading += da;
+      pts.push({ x, y });
+    }
+  }
+
+  for (const s of segs) {
+    if (s.type === "line") addLine(Number(s.len) || 0);
+    else if (s.type === "arc") addArc(Number(s.r) || 0, Number(s.a) || 0);
+  }
+
+  // clamp X only
+  for (const p of pts) {
+    p.x = clamp(p.x, TRACK_W * 0.5 + 8, WORLD_W - TRACK_W * 0.5 - 8);
+  }
+
+  const end = pts[pts.length - 1];
+  let prev = pts[Math.max(0, pts.length - 2)];
+  for (let k = pts.length - 2; k >= 0; k--) {
+    const cand = pts[k];
+    if (Math.hypot(end.x - cand.x, end.y - cand.y) > 0.001) { prev = cand; break; }
+  }
+
+  const dx = end.x - prev.x;
+  const dy = end.y - prev.y;
+  const len = Math.hypot(dx, dy) || 1;
+
+  return {
+    finishX: end.x,
+    finishY: end.y,
+    finishTX: dx / len,
+    finishTY: dy / len,
+    trackW: TRACK_W,
+    worldW: WORLD_W,
+    worldH: WORLD_H,
+  };
+}
+
+// dist point to segment
+function distPointToSegment(px, py, ax, ay, bx, by) {
+  const abx = bx - ax, aby = by - ay;
+  const apx = px - ax, apy = py - ay;
+  const abLen2 = abx * abx + aby * aby || 1;
+
+  let t = (apx * abx + apy * aby) / abLen2;
+  t = clamp(t, 0, 1);
+
+  const cx = ax + abx * t;
+  const cy = ay + aby * t;
+
+  return Math.hypot(px - cx, py - cy);
+}
+
+const finishGeomCache = new Map(); // trackId -> geom
+function getFinishGeom(trackId) {
+  const key = String(trackId);
+  if (finishGeomCache.has(key)) return finishGeomCache.get(key);
+  const g = buildFinishGeom(key);
+  finishGeomCache.set(key, g);
+  return g;
+}
+
+// verifiera finish-claim: {x,y} nära mållinje
+function verifyFinishClaim(trackId, x, y) {
+  const g = getFinishGeom(trackId);
+  if (!g) return { ok: false, err: "unknown_track" };
+
+  const px = Number(x);
+  const py = Number(y);
+  if (!Number.isFinite(px) || !Number.isFinite(py)) return { ok: false, err: "bad_xy" };
+
+  // bygg segmentet tvärs över banan (samma som klient)
+  const nx = -g.finishTY;
+  const ny =  g.finishTX;
+
+  const half = g.trackW / 2;
+
+  const ax = g.finishX - nx * half;
+  const ay = g.finishY - ny * half;
+  const bx = g.finishX + nx * half;
+  const by = g.finishY + ny * half;
+
+  const d = distPointToSegment(px, py, ax, ay, bx, by);
+  const thr = FINISH_VERIFY_PLAYER_R_W + FINISH_VERIFY_EPS_W;
+
+  return { ok: d <= thr, d, thr };
 }
 
 /* =========================
@@ -330,7 +527,8 @@ app.post("/ready", (req, res) => {
 });
 
 app.post("/finish", (req, res) => {
-  const { track, cid } = req.body || {};
+  // ✅ vi tar emot x,y (och ev vx,vy) så servern kan sätta spelaren på mållinjen direkt
+  const { track, cid, x, y, vx, vy } = req.body || {};
   if (!track || !cid) return res.status(400).json({ ok: false, err: "missing_track_or_cid" });
 
   const trackId = String(track);
@@ -339,24 +537,61 @@ app.post("/finish", (req, res) => {
   const tr = getTrack(trackId);
   cleanup(tr);
 
+  // säkerställ player
   if (!tr.players.has(C)) {
     tr.players.set(C, { x: 0, y: 0, vx: 0, vy: 0, ts: nowMs(), ready: false, finishedAtEpochMs: null });
   }
 
   const p = tr.players.get(C);
   p.ts = nowMs();
+
+  // ✅ uppdatera pos om klienten skickar (valfritt men bra)
+  if (Number.isFinite(Number(x))) p.x = Number(x);
+  if (Number.isFinite(Number(y))) p.y = Number(y);
+  if (Number.isFinite(Number(vx))) p.vx = Number(vx);
+  if (Number.isFinite(Number(vy))) p.vy = Number(vy);
+
+  // ✅ servern sätter finish-tiden (för fairness)
   if (!Number.isFinite(p.finishedAtEpochMs)) p.finishedAtEpochMs = nowMs();
+
+  // ✅ vinnare = första som finishar
   if (!tr.winnerCid) tr.winnerCid = C;
 
+  // ✅ broadcast (WS)
   for (const ws2 of tr.ws.values()) {
-    wsSafeSend(ws2, { type: "finish", cid: C, finishedAtEpochMs: p.finishedAtEpochMs, winnerCid: tr.winnerCid, serverNowMs: nowMs() });
-  }
-  for (const res2 of tr.sse.values()) {
-    sseSend(res2, "finish", { cid: C, finishedAtEpochMs: p.finishedAtEpochMs, winnerCid: tr.winnerCid, serverNowMs: nowMs() });
+    wsSafeSend(ws2, {
+      type: "finish",
+      track: trackId,
+      cid: C,
+      finishedAtEpochMs: p.finishedAtEpochMs,
+      winnerCid: tr.winnerCid,
+      // skickar även “sista pos” så klienter kan snappa ghost till mållinjen
+      x: p.x, y: p.y, vx: p.vx, vy: p.vy,
+      serverNowMs: nowMs()
+    });
   }
 
-  return res.json({ ok: true, winnerCid: tr.winnerCid, finishedAtEpochMs: p.finishedAtEpochMs });
+  // ✅ broadcast (SSE) – om du vill ha kvar kompat
+  for (const res2 of tr.sse.values()) {
+    sseSend(res2, "finish", {
+      track: trackId,
+      cid: C,
+      finishedAtEpochMs: p.finishedAtEpochMs,
+      winnerCid: tr.winnerCid,
+      x: p.x, y: p.y, vx: p.vx, vy: p.vy,
+      serverNowMs: nowMs()
+    });
+  }
+
+  return res.json({
+    ok: true,
+    track: trackId,
+    cid: C,
+    winnerCid: tr.winnerCid,
+    finishedAtEpochMs: p.finishedAtEpochMs
+  });
 });
+
 
 /* =========================
    WebSocket server (/ws)
@@ -478,11 +713,11 @@ wss.on("connection", (ws) => {
       return;
     }
 
-	// FINISH: {type:"finish"}
-	if (msg.type === "finish") {
-	  const tr = getTrack(trackId);
+	// FINISH-CLAIM: {type:"finishClaim", x, y}
+	if (msg.type === "finishClaim") {
 	  cleanup(tr);
 
+	  // Skapa spelare om saknas
 	  if (!tr.players.has(cid)) {
 		tr.players.set(cid, { x: 0, y: 0, vx: 0, vy: 0, ts: nowMs(), ready: false, finishedAtEpochMs: null });
 	  }
@@ -490,15 +725,22 @@ wss.on("connection", (ws) => {
 	  const p = tr.players.get(cid);
 	  p.ts = nowMs();
 
-	  // ✅ servern avgör tiden (rättvist)
-	  if (!Number.isFinite(p.finishedAtEpochMs)) {
-		p.finishedAtEpochMs = nowMs();
+	  // redan i mål? ignore (idempotent)
+	  if (Number.isFinite(p.finishedAtEpochMs)) return;
+
+	  // verifiera mot serverns mållinje
+	  const v = verifyFinishClaim(trackId, msg.x, msg.y);
+	  if (!v.ok) {
+		// valfritt: debug-a lite men spamma inte
+		// wsSafeSend(ws, { type:"finishRejected", reason: v.err || "not_on_finish", d: v.d, thr: v.thr, serverNowMs: nowMs() });
+		return;
 	  }
 
-	  // ✅ vinnare = första som finishar
-	  if (!tr.winnerCid) {
-		tr.winnerCid = cid;
-	  }
+	  // ✅ servern sätter tiden (rättvist)
+	  p.finishedAtEpochMs = nowMs();
+
+	  // ✅ vinnare = första verifierade finish
+	  if (!tr.winnerCid) tr.winnerCid = cid;
 
 	  // broadcast till alla WS
 	  for (const ws2 of tr.ws.values()) {
