@@ -9,6 +9,19 @@
   },
   "dependencies": {
     "cors": "^2.8.5",
-    "express": "^4.19.2"
-  }
+    "express": "^4.19.2",
+    "ws": "^8.19.0"
+  },
+  "description": "runner-mp-sse",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jonasrunefelt-sudo/runner-mp-sse.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/jonasrunefelt-sudo/runner-mp-sse/issues"
+  },
+  "homepage": "https://github.com/jonasrunefelt-sudo/runner-mp-sse#readme"
 }
