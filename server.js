@@ -211,7 +211,8 @@ app.get("/sse", (req, res) => {
   // keep-alive ping
   const ping = setInterval(() => {
     try {
-      const p = tr.players.get(cid);
+      // ✅ håll spelaren "alive" även om den inte tickar (t.ex. i menyn)
+      const p = track.players.get(cid);
       if (p) p.ts = nowMs();
       sseSend(res, "ping", { t: nowMs() });
     } catch {}
