@@ -429,12 +429,12 @@ app.post("/finish", (req, res) => {
   if (!tr.winnerCid) tr.winnerCid = C;
 
   const payload = {
-    type: "finish",
-    cid: C,
-    finishedAtEpochMs: p.finishedAtEpochMs,
-    winnerCid: tr.winnerCid,
-    finish: p.finish,
-    serverNowMs: nowMs(),
+	  type: "finish",
+	  cid,
+	  finishedAtEpochMs: p.finishedAtEpochMs,
+	  winnerCid: tr.winnerCid,
+	  serverNowMs: nowMs(),
+	  finish: { x: p.x, y: p.y },   // ✅ EXAKT position
   };
 
   for (const ws2 of tr.ws.values()) wsSafeSend(ws2, payload);
@@ -609,77 +609,74 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    // FINISH: {type:"finish", x, y, runMs}
-    if (msg.type === "finish") {
-      cleanup(tr);
+	// FINISH: {type:"finish", x, y, runMs}
+	if (msg.type === "finish") {
+	  cleanup(tr);
 
-      if (!tr.players.has(cid)) {
-        tr.players.set(cid, {
-          x: 0,
-          y: 0,
-          vx: 0,
-          vy: 0,
-          ts: nowMs(),
-          ready: false,
-          finishedAtEpochMs: null,
-          finish: null,
-        });
-      }
+	  if (!tr.players.has(cid)) {
+		tr.players.set(cid, {
+		  x: 0,
+		  y: 0,
+		  vx: 0,
+		  vy: 0,
+		  ts: nowMs(),
+		  ready: false,
+		  finishedAtEpochMs: null,
+		  finish: null,
+		});
+	  }
 
-      const p = tr.players.get(cid);
-      p.ts = nowMs();
+	  const p = tr.players.get(cid);
+	  p.ts = nowMs();
 
-      // ✅ servern avgör tiden (rättvist för "vem vann")
-      if (!Number.isFinite(p.finishedAtEpochMs)) {
-        p.finishedAtEpochMs = nowMs();
-      }
+	  // ✅ ta emot finish-position från klienten
+	  const fx = Number(msg.x);
+	  const fy = Number(msg.y);
+	  const frun = Number(msg.runMs);
 
-      // ✅ spara finish-payload för exakt “snap”
-      const fx = Number(msg.x);
-      const fy = Number(msg.y);
-      const frun = Number(msg.runMs);
+	  // Uppdatera även "senaste position" så snapshot matchar finish
+	  if (Number.isFinite(fx)) p.x = fx;
+	  if (Number.isFinite(fy)) p.y = fy;
 
-      p.finish = {
-        x: Number.isFinite(fx) ? fx : (p.x || 0),
-        y: Number.isFinite(fy) ? fy : (p.y || 0),
-        runMs: Number.isFinite(frun) ? frun : null,
-        serverNowMs: nowMs(),
-      };
+	  // ✅ servern avgör tiden (rättvist för "vem vann")
+	  if (!Number.isFinite(p.finishedAtEpochMs)) {
+		p.finishedAtEpochMs = nowMs();
+	  }
 
-      // ✅ vinnare = första som finishar
-      if (!tr.winnerCid) {
-        tr.winnerCid = cid;
-      }
+	  // ✅ spara finish-payload för exakt “snap”
+	  p.finish = {
+		x: Number.isFinite(fx) ? fx : (p.x || 0),
+		y: Number.isFinite(fy) ? fy : (p.y || 0),
+		runMs: Number.isFinite(frun) ? frun : null,
+		serverNowMs: nowMs(),
+	  };
 
-      const payload = {
-        type: "finish",
-        cid,
-        finishedAtEpochMs: p.finishedAtEpochMs,
-        winnerCid: tr.winnerCid,
-        finish: p.finish,
-        serverNowMs: nowMs(),
-      };
+	  // ✅ vinnare = första som finishar
+	  if (!tr.winnerCid) {
+		tr.winnerCid = cid;
+	  }
 
-      // broadcast till alla WS
-      for (const ws2 of tr.ws.values()) {
-        wsSafeSend(ws2, payload);
-      }
+	  const payload = {
+		type: "finish",
+		cid,
+		finishedAtEpochMs: p.finishedAtEpochMs,
+		winnerCid: tr.winnerCid,
+		serverNowMs: nowMs(),
+		finish: p.finish, // ✅ skicka hela objektet (x,y,runMs,serverNowMs)
+	  };
 
-      // (valfritt) till SSE också
-      for (const res2 of tr.sse.values()) {
-        sseSend(res2, "finish", payload);
-      }
+	  // broadcast till alla WS
+	  for (const ws2 of tr.ws.values()) {
+		wsSafeSend(ws2, payload);
+	  }
 
-      return;
-    }
+	  // (valfritt) till SSE också
+	  for (const res2 of tr.sse.values()) {
+		sseSend(res2, "finish", payload);
+	  }
 
-    // LEAVE: {type:"leave"}
-    if (msg.type === "leave") {
-      try {
-        ws.close();
-      } catch {}
-      return;
-    }
+	  return;
+	}
   });
 
   ws.on("close", () => {
