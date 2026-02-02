@@ -112,8 +112,9 @@ function startWsBroadcastLoop(trackId) {
   const tr = getTrack(trackId);
   if (tr._broadcastTimer) return;
 
-  const HZ = 15; // 10–20 är lagom
-  const PERIOD = Math.floor(1000 / HZ);
+  // ✅ Höj snapshot-hz här (detta är din "strypbricka")
+  const HZ = Number(process.env.SNAPSHOT_HZ || 30); // 30 Hz default
+  const PERIOD = Math.max(10, Math.round(1000 / Math.max(1, HZ))); // clamp (min 10ms)
 
   tr._broadcastTimer = setInterval(() => {
     cleanup(tr);
@@ -125,16 +126,23 @@ function startWsBroadcastLoop(trackId) {
 
     for (const [cid, p] of tr.players.entries()) {
       if (p.ready) readyCount++;
+
+      // ✅ Skicka NULL om position ej initierad istället för 0
+      const x = Number.isFinite(p.x) ? p.x : null;
+      const y = Number.isFinite(p.y) ? p.y : null;
+      const vx = Number.isFinite(p.vx) ? p.vx : 0;
+      const vy = Number.isFinite(p.vy) ? p.vy : 0;
+
       players.push({
         cid,
-        x: p.x || 0,
-        y: p.y || 0,
-        vx: p.vx || 0,
-        vy: p.vy || 0,
+        x,
+        y,
+        vx,
+        vy,
         ts: p.ts || 0,
         ready: !!p.ready,
         finishedAtEpochMs: p.finishedAtEpochMs ?? null,
-        finish: p.finish ?? null, // ✅
+        finish: p.finish ?? null,
       });
     }
 
