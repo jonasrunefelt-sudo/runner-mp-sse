@@ -1,17 +1,31 @@
-// server.js
+// server.js (WS-only)
+// Node + Express + ws
+//
+// Env vars:
+// - PORT (default 3000)
+// - TTL_MS (default 60000)
+// - SNAPSHOT_HZ (default 30)
+// - START_DELAY_MS (default 3500)
+
 import express from "express";
 import cors from "cors";
 import http from "http";
 import { WebSocketServer } from "ws";
 
 const app = express();
-app.use(cors()); // OK för test
+app.use(cors());
 app.use(express.json({ limit: "64kb" }));
 
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT || 3000);
+const TTL_MS = Number(process.env.TTL_MS || 60000);
+const SNAPSHOT_HZ = Number(process.env.SNAPSHOT_HZ || 30);
+const START_DELAY_MS = Number(process.env.START_DELAY_MS || 3500);
+
+function nowMs() {
+  return Date.now();
+}
 
 /**
- * In-memory state per track:
  * tracks[trackId] = {
  *   players: Map(cid -> {
  *     x,y,vx,vy, ts, ready,
@@ -20,17 +34,11 @@ const PORT = process.env.PORT || 3000;
  *   }),
  *   startAtEpochMs: number|null,
  *   winnerCid: string|null,
- *   sse: Map(cid -> res),
- *   ws:  Map(cid -> ws),
+ *   ws: Map(cid -> ws),
  *   _broadcastTimer: any,
  * }
  */
 const tracks = new Map();
-const TTL_MS = 60000;
-
-function nowMs() {
-  return Date.now();
-}
 
 function getTrack(trackId) {
   if (!tracks.has(trackId)) {
@@ -38,7 +46,6 @@ function getTrack(trackId) {
       players: new Map(),
       startAtEpochMs: null,
       winnerCid: null,
-      sse: new Map(),
       ws: new Map(),
       _broadcastTimer: null,
     });
@@ -46,61 +53,6 @@ function getTrack(trackId) {
   return tracks.get(trackId);
 }
 
-function cleanup(track) {
-  const t = nowMs();
-
-  for (const [cid, p] of track.players.entries()) {
-    if (t - (p.ts || 0) > TTL_MS) {
-      track.players.delete(cid);
-
-      const sseRes = track.sse.get(cid);
-      if (sseRes) {
-        try {
-          sseRes.end();
-        } catch {}
-        track.sse.delete(cid);
-      }
-
-      const ws = track.ws.get(cid);
-      if (ws) {
-        try {
-          ws.close();
-        } catch {}
-        track.ws.delete(cid);
-      }
-    }
-  }
-
-  // Om <2 spelare kvar: nolla start/ready/winner + finish state
-  if (track.players.size < 2) {
-    track.startAtEpochMs = null;
-    track.winnerCid = null;
-    for (const p of track.players.values()) {
-      p.ready = false;
-      p.finishedAtEpochMs = null;
-      p.finish = null;
-    }
-  }
-}
-
-function opponentOf(track, cid) {
-  for (const [k, v] of track.players.entries()) {
-    if (k !== cid) return { cid: k, p: v };
-  }
-  return null;
-}
-
-/* =========================
-   SSE helpers
-========================= */
-function sseSend(res, event, dataObj) {
-  res.write(`event: ${event}\n`);
-  res.write(`data: ${JSON.stringify(dataObj)}\n\n`);
-}
-
-/* =========================
-   WS helpers
-========================= */
 function wsSafeSend(ws, obj) {
   if (!ws || ws.readyState !== ws.OPEN) return;
   try {
@@ -108,13 +60,70 @@ function wsSafeSend(ws, obj) {
   } catch {}
 }
 
+function broadcast(tr, obj) {
+  for (const ws of tr.ws.values()) wsSafeSend(ws, obj);
+}
+
+function cleanup(tr) {
+  const t = nowMs();
+
+  for (const [cid, p] of tr.players.entries()) {
+    if (t - (p.ts || 0) > TTL_MS) {
+      tr.players.delete(cid);
+
+      const ws = tr.ws.get(cid);
+      if (ws) {
+        try {
+          ws.close();
+        } catch {}
+        tr.ws.delete(cid);
+      }
+    }
+  }
+
+  // Om <2 spelare: nolla matchstate och kräva ny ready
+  if (tr.players.size < 2) {
+    resetMatch(tr, { broadcastStartNull: true });
+  }
+}
+
+function resetMatch(tr, { broadcastStartNull } = { broadcastStartNull: false }) {
+  tr.startAtEpochMs = null;
+  tr.winnerCid = null;
+
+  for (const p of tr.players.values()) {
+    p.ready = false;
+    p.finishedAtEpochMs = null;
+    p.finish = null;
+  }
+
+  if (broadcastStartNull) {
+    broadcast(tr, { type: "start", startAtEpochMs: null, serverNowMs: nowMs() });
+  }
+}
+
+function maybeArmStart(tr) {
+  if (Number.isFinite(tr.startAtEpochMs)) return; // already armed
+
+  if (tr.players.size < 2) return;
+
+  // kräver att alla är ready
+  for (const p of tr.players.values()) {
+    if (!p.ready) return;
+  }
+
+  tr.startAtEpochMs = nowMs() + START_DELAY_MS;
+
+  // pusha start event via WS
+  broadcast(tr, { type: "start", startAtEpochMs: tr.startAtEpochMs, serverNowMs: nowMs() });
+}
+
 function startWsBroadcastLoop(trackId) {
   const tr = getTrack(trackId);
   if (tr._broadcastTimer) return;
 
-  // ✅ Höj snapshot-hz här (detta är din "strypbricka")
-  const HZ = Number(process.env.SNAPSHOT_HZ || 30); // 30 Hz default
-  const PERIOD = Math.max(10, Math.round(1000 / Math.max(1, HZ))); // clamp (min 10ms)
+  const hz = Number.isFinite(SNAPSHOT_HZ) && SNAPSHOT_HZ > 0 ? SNAPSHOT_HZ : 30;
+  const period = Math.max(10, Math.round(1000 / hz));
 
   tr._broadcastTimer = setInterval(() => {
     cleanup(tr);
@@ -127,7 +136,7 @@ function startWsBroadcastLoop(trackId) {
     for (const [cid, p] of tr.players.entries()) {
       if (p.ready) readyCount++;
 
-      // ✅ Skicka NULL om position ej initierad istället för 0
+      // ✅ Skicka null om position ej initierad (inte 0,0)
       const x = Number.isFinite(p.x) ? p.x : null;
       const y = Number.isFinite(p.y) ? p.y : null;
       const vx = Number.isFinite(p.vx) ? p.vx : 0;
@@ -157,299 +166,14 @@ function startWsBroadcastLoop(trackId) {
       readyCount,
     };
 
-    for (const ws of tr.ws.values()) {
-      wsSafeSend(ws, pkt);
-    }
-  }, PERIOD);
-}
-
-function maybeArmStart(tr) {
-  if (Number.isFinite(tr.startAtEpochMs)) return;
-
-  // kräver minst 2 spelare och att alla är ready
-  if (tr.players.size < 2) return;
-
-  let allReady = true;
-  for (const p of tr.players.values()) {
-    if (!p.ready) {
-      allReady = false;
-      break;
-    }
-  }
-  if (!allReady) return;
-
-  // marginal: 3.5s
-  tr.startAtEpochMs = nowMs() + 3500;
-
-  // pusha start event till SSE
-  for (const res2 of tr.sse.values()) {
-    sseSend(res2, "start", { startAtEpochMs: tr.startAtEpochMs, serverNowMs: nowMs() });
-  }
-
-  // pusha start event till WS
-  for (const ws of tr.ws.values()) {
-    wsSafeSend(ws, { type: "start", startAtEpochMs: tr.startAtEpochMs, serverNowMs: nowMs() });
-  }
-}
-
-function resetStart(tr) {
-  tr.startAtEpochMs = null;
-  tr.winnerCid = null;
-  for (const p of tr.players.values()) {
-    p.ready = false;
-    p.finishedAtEpochMs = null;
-    p.finish = null;
-  }
-
-  for (const res2 of tr.sse.values()) {
-    sseSend(res2, "start", { startAtEpochMs: null, serverNowMs: nowMs() });
-  }
-  for (const ws of tr.ws.values()) {
-    wsSafeSend(ws, { type: "start", startAtEpochMs: null, serverNowMs: nowMs() });
-  }
+    broadcast(tr, pkt);
+  }, period);
 }
 
 /* =========================
-   HTTP routes
+   HTTP routes (minimal)
 ========================= */
 app.get("/health", (req, res) => res.status(200).json({ ok: true }));
-
-// SSE: klienten lyssnar på server events
-app.get("/sse", (req, res) => {
-  const trackId = String(req.query.track || "track-000");
-  const cid = String(req.query.cid || "");
-  if (!cid) return res.status(400).json({ ok: false, err: "missing_cid" });
-
-  const tr = getTrack(trackId);
-  cleanup(tr);
-
-  // markera som online
-  if (!tr.players.has(cid)) {
-    tr.players.set(cid, {
-      x: 0,
-      y: 0,
-      vx: 0,
-      vy: 0,
-      ts: nowMs(),
-      ready: false,
-      finishedAtEpochMs: null,
-      finish: null,
-    });
-  } else {
-    tr.players.get(cid).ts = nowMs();
-  }
-
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-  res.setHeader("Connection", "keep-alive");
-  res.flushHeaders?.();
-
-  tr.sse.set(cid, res);
-
-  const opp = opponentOf(tr, cid);
-  sseSend(res, "state", {
-    ok: true,
-    track: trackId,
-    startAtEpochMs: tr.startAtEpochMs,
-    winnerCid: tr.winnerCid ?? null,
-    hasOpponent: !!opp,
-    opponent: opp ? { ...opp.p, cid: opp.cid, ageMs: nowMs() - (opp.p.ts || nowMs()) } : null,
-    serverNowMs: nowMs(),
-  });
-
-  // keep-alive ping
-  const ping = setInterval(() => {
-    try {
-      const p = tr.players.get(cid);
-      if (p) p.ts = nowMs();
-      sseSend(res, "ping", { t: nowMs() });
-    } catch {}
-  }, 15000);
-
-  req.on("close", () => {
-    clearInterval(ping);
-    const tr2 = getTrack(trackId);
-    tr2.sse.delete(cid);
-  });
-});
-
-// POST tick (SSE/REST-läge): klient postar sin position
-app.post("/tick", (req, res) => {
-  const { track, cid, x, y, vx, vy } = req.body || {};
-  if (!track || !cid) return res.status(400).json({ ok: false, err: "missing_track_or_cid" });
-
-  const trackId = String(track);
-  const C = String(cid);
-
-  const tr = getTrack(trackId);
-  cleanup(tr);
-
-  if (!tr.players.has(C)) {
-    tr.players.set(C, {
-      x: 0,
-      y: 0,
-      vx: 0,
-      vy: 0,
-      ts: nowMs(),
-      ready: false,
-      finishedAtEpochMs: null,
-      finish: null,
-    });
-  }
-
-  const p = tr.players.get(C);
-  p.x = Number(x) || 0;
-  p.y = Number(y) || 0;
-  p.vx = Number(vx) || 0;
-  p.vy = Number(vy) || 0;
-  p.ts = nowMs();
-
-  // push update till andra via SSE
-  const opp = opponentOf(tr, C);
-  if (opp) {
-    const oppRes = tr.sse.get(opp.cid);
-    if (oppRes) {
-      sseSend(oppRes, "opponent", {
-        x: p.x,
-        y: p.y,
-        vx: p.vx,
-        vy: p.vy,
-        ageMs: 0,
-        ready: !!p.ready,
-        cid: C,
-      });
-    }
-  }
-
-  return res.json({
-    ok: true,
-    startAtEpochMs: tr.startAtEpochMs,
-    playersCount: tr.players.size,
-  });
-});
-
-// POST ready (SSE/REST-läge)
-app.post("/ready", (req, res) => {
-  const { track, cid, ready } = req.body || {};
-  if (!track || !cid) return res.status(400).json({ ok: false, err: "missing_track_or_cid" });
-
-  const trackId = String(track);
-  const C = String(cid);
-
-  const tr = getTrack(trackId);
-  cleanup(tr);
-
-  if (!tr.players.has(C)) {
-    tr.players.set(C, {
-      x: 0,
-      y: 0,
-      vx: 0,
-      vy: 0,
-      ts: nowMs(),
-      ready: false,
-      finishedAtEpochMs: null,
-      finish: null,
-    });
-  }
-
-  const p = tr.players.get(C);
-  p.ready = !!ready;
-  p.ts = nowMs();
-
-  // arm/nolla start
-  if (tr.players.size >= 2) {
-    let allReady = true;
-    for (const pl of tr.players.values()) {
-      if (!pl.ready) {
-        allReady = false;
-        break;
-      }
-    }
-    if (allReady) {
-      if (!Number.isFinite(tr.startAtEpochMs)) tr.startAtEpochMs = nowMs() + 3500;
-    } else {
-      tr.startAtEpochMs = null;
-    }
-  } else {
-    tr.startAtEpochMs = null;
-  }
-
-  // broadcast startAt till alla SSE-klienter
-  for (const res2 of tr.sse.values()) {
-    sseSend(res2, "start", { startAtEpochMs: tr.startAtEpochMs, serverNowMs: nowMs() });
-  }
-
-  // broadcast startAt till alla WS-klienter
-  for (const ws of tr.ws.values()) {
-    wsSafeSend(ws, { type: "start", startAtEpochMs: tr.startAtEpochMs, serverNowMs: nowMs() });
-  }
-
-  return res.json({
-    ok: true,
-    startAtEpochMs: tr.startAtEpochMs,
-    playersCount: tr.players.size,
-  });
-});
-
-// HTTP finish (om du vill ha kvar REST-variant)
-// Body: {track,cid,x,y,runMs}
-app.post("/finish", (req, res) => {
-  const { track, cid, x, y, runMs } = req.body || {};
-  if (!track || !cid) return res.status(400).json({ ok: false, err: "missing_track_or_cid" });
-
-  const trackId = String(track);
-  const C = String(cid);
-
-  const tr = getTrack(trackId);
-  cleanup(tr);
-
-  if (!tr.players.has(C)) {
-    tr.players.set(C, {
-      x: 0,
-      y: 0,
-      vx: 0,
-      vy: 0,
-      ts: nowMs(),
-      ready: false,
-      finishedAtEpochMs: null,
-      finish: null,
-    });
-  }
-
-  const p = tr.players.get(C);
-  p.ts = nowMs();
-
-  // ✅ servern tidsstämplar finish (rättvist för "vem vann")
-  if (!Number.isFinite(p.finishedAtEpochMs)) p.finishedAtEpochMs = nowMs();
-
-  // ✅ spara finish-payload (för exakt “snap” visuellt)
-  const fx = Number(x);
-  const fy = Number(y);
-  const frun = Number(runMs);
-  p.finish = {
-    x: Number.isFinite(fx) ? fx : (p.x || 0),
-    y: Number.isFinite(fy) ? fy : (p.y || 0),
-    runMs: Number.isFinite(frun) ? frun : null,
-    serverNowMs: nowMs(),
-  };
-
-  // ✅ vinnare = första som finishar
-  if (!tr.winnerCid) tr.winnerCid = C;
-
-  const payload = {
-	  type: "finish",
-	  cid,
-	  finishedAtEpochMs: p.finishedAtEpochMs,
-	  winnerCid: tr.winnerCid,
-	  serverNowMs: nowMs(),
-	  finish: { x: p.x, y: p.y },   // ✅ EXAKT position
-  };
-
-  for (const ws2 of tr.ws.values()) wsSafeSend(ws2, payload);
-  for (const res2 of tr.sse.values()) sseSend(res2, "finish", payload);
-
-  return res.json({ ok: true, winnerCid: tr.winnerCid, finishedAtEpochMs: p.finishedAtEpochMs });
-});
 
 /* =========================
    WebSocket server (/ws)
@@ -486,7 +210,7 @@ function startPingLoop(ws) {
 wss.on("connection", (ws) => {
   startPingLoop(ws);
 
-  // bindas efter hello
+  // binds after hello
   let trackId = null;
   let cid = null;
 
@@ -515,8 +239,8 @@ wss.on("connection", (ws) => {
       // register player if not exists
       if (!tr.players.has(cid)) {
         tr.players.set(cid, {
-          x: 0,
-          y: 0,
+          x: null,
+          y: null,
           vx: 0,
           vy: 0,
           ts: nowMs(),
@@ -528,6 +252,7 @@ wss.on("connection", (ws) => {
         tr.players.get(cid).ts = nowMs();
       }
 
+      // state ack
       wsSafeSend(ws, {
         type: "state",
         ok: true,
@@ -538,10 +263,16 @@ wss.on("connection", (ws) => {
         playersCount: tr.players.size,
       });
 
+      // inform remaining about start reset when someone joins mid-cycle
+      // (valfritt: vill du istället låta joiner bara "titta"? ta bort detta)
+      if (tr.players.size >= 2 && !Number.isFinite(tr.startAtEpochMs)) {
+        // nothing
+      }
+
       return;
     }
 
-    // måste hello först
+    // must hello first
     if (!trackId || !cid) return;
 
     const tr = getTrack(trackId);
@@ -551,8 +282,8 @@ wss.on("connection", (ws) => {
     if (msg.type === "update") {
       if (!tr.players.has(cid)) {
         tr.players.set(cid, {
-          x: 0,
-          y: 0,
+          x: null,
+          y: null,
           vx: 0,
           vy: 0,
           ts: nowMs(),
@@ -579,8 +310,8 @@ wss.on("connection", (ws) => {
     if (msg.type === "ready") {
       if (!tr.players.has(cid)) {
         tr.players.set(cid, {
-          x: 0,
-          y: 0,
+          x: null,
+          y: null,
           vx: 0,
           vy: 0,
           ts: nowMs(),
@@ -589,23 +320,18 @@ wss.on("connection", (ws) => {
           finish: null,
         });
       }
+
       const p = tr.players.get(cid);
       p.ready = !!msg.ready;
       p.ts = nowMs();
 
-      // om någon blir unready -> resetta start
+      // om någon blir unready -> resetta match direkt (ny ready krävs)
       if (!p.ready) {
-        tr.startAtEpochMs = null;
-        // (valfritt) även nolla winner/finish om du vill kräva ny match:
-        tr.winnerCid = null;
-        for (const pl of tr.players.values()) {
-          pl.finishedAtEpochMs = null;
-          pl.finish = null;
-        }
+        resetMatch(tr, { broadcastStartNull: true });
+      } else {
+        // om alla ready -> arm start
+        maybeArmStart(tr);
       }
-
-      // om alla ready -> sätt start
-      maybeArmStart(tr);
 
       wsSafeSend(ws, {
         type: "readyAck",
@@ -617,96 +343,79 @@ wss.on("connection", (ws) => {
       return;
     }
 
-	// FINISH: {type:"finish", x, y, runMs}
-	if (msg.type === "finish") {
-	  cleanup(tr);
+    // FINISH: {type:"finish", x, y, runMs}
+    if (msg.type === "finish") {
+      if (!tr.players.has(cid)) {
+        tr.players.set(cid, {
+          x: null,
+          y: null,
+          vx: 0,
+          vy: 0,
+          ts: nowMs(),
+          ready: false,
+          finishedAtEpochMs: null,
+          finish: null,
+        });
+      }
 
-	  if (!tr.players.has(cid)) {
-		tr.players.set(cid, {
-		  x: 0,
-		  y: 0,
-		  vx: 0,
-		  vy: 0,
-		  ts: nowMs(),
-		  ready: false,
-		  finishedAtEpochMs: null,
-		  finish: null,
-		});
-	  }
+      const p = tr.players.get(cid);
+      p.ts = nowMs();
 
-	  const p = tr.players.get(cid);
-	  p.ts = nowMs();
+      const fx = Number(msg.x);
+      const fy = Number(msg.y);
+      const frun = Number(msg.runMs);
 
-	  // ✅ ta emot finish-position från klienten
-	  const fx = Number(msg.x);
-	  const fy = Number(msg.y);
-	  const frun = Number(msg.runMs);
+      // Uppdatera även "senaste position" så snapshot matchar finish
+      if (Number.isFinite(fx)) p.x = fx;
+      if (Number.isFinite(fy)) p.y = fy;
 
-	  // Uppdatera även "senaste position" så snapshot matchar finish
-	  if (Number.isFinite(fx)) p.x = fx;
-	  if (Number.isFinite(fy)) p.y = fy;
+      // Servern tidsstämplar finish rättvist
+      if (!Number.isFinite(p.finishedAtEpochMs)) p.finishedAtEpochMs = nowMs();
 
-	  // ✅ servern avgör tiden (rättvist för "vem vann")
-	  if (!Number.isFinite(p.finishedAtEpochMs)) {
-		p.finishedAtEpochMs = nowMs();
-	  }
+      // Spara finish-payload för exakt “snap”
+      p.finish = {
+        x: Number.isFinite(fx) ? fx : (Number.isFinite(p.x) ? p.x : 0),
+        y: Number.isFinite(fy) ? fy : (Number.isFinite(p.y) ? p.y : 0),
+        runMs: Number.isFinite(frun) ? frun : null,
+        serverNowMs: nowMs(),
+      };
 
-	  // ✅ spara finish-payload för exakt “snap”
-	  p.finish = {
-		x: Number.isFinite(fx) ? fx : (p.x || 0),
-		y: Number.isFinite(fy) ? fy : (p.y || 0),
-		runMs: Number.isFinite(frun) ? frun : null,
-		serverNowMs: nowMs(),
-	  };
+      // vinnare = första som finishar
+      if (!tr.winnerCid) tr.winnerCid = cid;
 
-	  // ✅ vinnare = första som finishar
-	  if (!tr.winnerCid) {
-		tr.winnerCid = cid;
-	  }
+      const payload = {
+        type: "finish",
+        cid,
+        finishedAtEpochMs: p.finishedAtEpochMs,
+        winnerCid: tr.winnerCid,
+        serverNowMs: nowMs(),
+        finish: p.finish,
+      };
 
-	  const payload = {
-		type: "finish",
-		cid,
-		finishedAtEpochMs: p.finishedAtEpochMs,
-		winnerCid: tr.winnerCid,
-		serverNowMs: nowMs(),
-		finish: p.finish, // ✅ skicka hela objektet (x,y,runMs,serverNowMs)
-	  };
+      broadcast(tr, payload);
+      return;
+    }
 
-	  // broadcast till alla WS
-	  for (const ws2 of tr.ws.values()) {
-		wsSafeSend(ws2, payload);
-	  }
-
-	  // (valfritt) till SSE också
-	  for (const res2 of tr.sse.values()) {
-		sseSend(res2, "finish", payload);
-	  }
-
-	  return;
-	}
+    // (valfritt) PING: {type:"ping"} -> time sync
+    if (msg.type === "ping") {
+      wsSafeSend(ws, { type: "pong", serverNowMs: nowMs() });
+      return;
+    }
   });
 
   ws.on("close", () => {
     if (!trackId || !cid) return;
+
     const tr = getTrack(trackId);
 
     tr.ws.delete(cid);
 
-    // val: spelare kan få ligga kvar en stund via TTL,
-    // men start ska nollas direkt
-    tr.startAtEpochMs = null;
-    tr.winnerCid = null;
-    for (const p of tr.players.values()) {
-      p.ready = false;
-      p.finishedAtEpochMs = null;
-      p.finish = null;
-    }
+    // match reset direkt när någon lämnar
+    resetMatch(tr, { broadcastStartNull: true });
 
-    // informera kvarvarande
-    for (const ws2 of tr.ws.values()) {
-      wsSafeSend(ws2, { type: "start", startAtEpochMs: null, serverNowMs: nowMs() });
-    }
+    // spelare får ligga kvar i players-map tills TTL tar bort dem,
+    // men du kan också ta bort direkt om du vill:
+    // tr.players.delete(cid);
   });
 });
 
@@ -714,5 +423,5 @@ wss.on("connection", (ws) => {
    Start server
 ========================= */
 httpServer.listen(PORT, () => {
-  console.log(`runner-mp listening (SSE+REST+WS) on ${PORT}`);
+  console.log(`runner-mp listening (WS-only) on ${PORT} | snapshot_hz=${SNAPSHOT_HZ}`);
 });
