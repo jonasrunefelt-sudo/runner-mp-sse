@@ -18,7 +18,7 @@ app.use(express.json({ limit: "64kb" }));
 
 const PORT = Number(process.env.PORT || 3000);
 const TTL_MS = Number(process.env.TTL_MS || 60000);
-const SNAPSHOT_HZ = Number(process.env.SNAPSHOT_HZ || 60);
+const SNAPSHOT_HZ = Number(process.env.SNAPSHOT_HZ || 70);
 const START_DELAY_MS = Number(process.env.START_DELAY_MS || 3500);
 
 function nowMs() {
