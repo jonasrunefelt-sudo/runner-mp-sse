@@ -223,8 +223,15 @@ wss.on("connection", (ws) => {
     }
     if (!msg || typeof msg !== "object") return;
 
-    // Allow ping/pong even before hello (health-only mode)
+    // PING: allow before hello (health-only) + treat as heartbeat after hello
     if (msg.type === "ping") {
+      // If we're already bound to a track+cid (hello done), refresh ts
+      if (trackId && cid) {
+        const tr = getTrack(trackId);
+        const p = tr.players.get(cid);
+        if (p) p.ts = nowMs();
+      }
+    
       wsSafeSend(ws, { type: "pong", serverNowMs: nowMs() });
       return;
     }
