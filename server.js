@@ -396,8 +396,12 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    // (valfritt) PING: {type:"ping"} -> time sync
+    // (valfritt) PING: {type:"ping"} -> time sync + heartbeat
     if (msg.type === "ping") {
+      // Treat ping as heartbeat: refresh player.ts without changing ready state
+      const p = tr.players.get(cid);
+      if (p) p.ts = nowMs();
+    
       wsSafeSend(ws, { type: "pong", serverNowMs: nowMs() });
       return;
     }
