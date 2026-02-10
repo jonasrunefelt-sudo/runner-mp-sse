@@ -223,6 +223,11 @@ wss.on("connection", (ws) => {
     }
     if (!msg || typeof msg !== "object") return;
 
+    // Allow ping/pong even before hello (health-only mode)
+    if (msg.type === "ping") {
+      wsSafeSend(ws, { type: "pong", serverNowMs: nowMs() });
+      return;
+    }
     // HELLO: {type:"hello", track, cid}
     if (msg.type === "hello") {
       trackId = String(msg.track || "track-000");
