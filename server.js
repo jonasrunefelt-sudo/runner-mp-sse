@@ -104,7 +104,6 @@ function resetMatch(tr, { broadcastStartNull } = { broadcastStartNull: false }) 
 
 function maybeArmStart(tr) {
   if (Number.isFinite(tr.startAtEpochMs)) return; // already armed
-
   if (tr.players.size < 2) return;
 
   // kräver att alla är ready
@@ -171,6 +170,66 @@ function startWsBroadcastLoop(trackId) {
 }
 
 /* =========================
+   GLOBAL: Track presence (WS-only, push)
+   - No HTTP endpoints
+   - Sent to ALL connected WS clients (also those not hello-bound)
+========================= */
+
+// All connected sockets (even before hello)
+const allWs = new Set();
+
+let presenceTimer = null;
+const PRESENCE_HZ = 1; // 1 Hz is enough for UI
+const PRESENCE_PERIOD_MS = Math.max(250, Math.round(1000 / PRESENCE_HZ));
+
+function sendGlobalTrackPresence() {
+  const t = nowMs();
+  const out = {};
+
+  for (const [trackId, tr] of tracks.entries()) {
+    // Do a light cleanup for accurate counts
+    cleanup(tr);
+
+    // Count "active" players as those with recent ts
+    let active = 0;
+    for (const p of tr.players.values()) {
+      if (t - (p.ts || 0) <= TTL_MS) active++;
+    }
+
+    if (active <= 0) continue;
+
+    // Simple phase split:
+    // - lobby: no start armed OR countdown not started yet
+    // - race: start time reached (includes ongoing race/finish waiting)
+    let lobby = 0;
+    let race = 0;
+
+    if (!Number.isFinite(tr.startAtEpochMs)) {
+      lobby = active;
+      race = 0;
+    } else if (t < tr.startAtEpochMs) {
+      // countdown phase (treat as lobby; you can show as "COUNTDOWN" client-side if you want)
+      lobby = active;
+      race = 0;
+    } else {
+      lobby = 0;
+      race = active;
+    }
+
+    out[String(trackId)] = { lobby, race };
+  }
+
+  const pkt = { type: "track_presence", serverNowMs: t, tracks: out };
+
+  for (const ws of allWs) wsSafeSend(ws, pkt);
+}
+
+function startGlobalPresenceLoop() {
+  if (presenceTimer) return;
+  presenceTimer = setInterval(sendGlobalTrackPresence, PRESENCE_PERIOD_MS);
+}
+
+/* =========================
    HTTP routes (minimal)
 ========================= */
 app.get("/health", (req, res) => res.status(200).json({ ok: true }));
@@ -210,6 +269,10 @@ function startPingLoop(ws) {
 wss.on("connection", (ws) => {
   startPingLoop(ws);
 
+  // ✅ global registry (so ONLINE track list can receive presence without hello)
+  allWs.add(ws);
+  startGlobalPresenceLoop();
+
   // binds after hello
   let trackId = null;
   let cid = null;
@@ -231,10 +294,11 @@ wss.on("connection", (ws) => {
         const p = tr.players.get(cid);
         if (p) p.ts = nowMs();
       }
-    
+
       wsSafeSend(ws, { type: "pong", serverNowMs: nowMs() });
       return;
     }
+
     // HELLO: {type:"hello", track, cid}
     if (msg.type === "hello") {
       trackId = String(msg.track || "track-000");
@@ -274,12 +338,6 @@ wss.on("connection", (ws) => {
         winnerCid: tr.winnerCid ?? null,
         playersCount: tr.players.size,
       });
-
-      // inform remaining about start reset when someone joins mid-cycle
-      // (valfritt: vill du istället låta joiner bara "titta"? ta bort detta)
-      if (tr.players.size >= 2 && !Number.isFinite(tr.startAtEpochMs)) {
-        // nothing
-      }
 
       return;
     }
@@ -410,16 +468,17 @@ wss.on("connection", (ws) => {
 
     // (valfritt) PING: {type:"ping"} -> time sync + heartbeat
     if (msg.type === "ping") {
-      // Treat ping as heartbeat: refresh player.ts without changing ready state
       const p = tr.players.get(cid);
       if (p) p.ts = nowMs();
-    
       wsSafeSend(ws, { type: "pong", serverNowMs: nowMs() });
       return;
     }
   });
 
   ws.on("close", () => {
+    // ✅ remove from global
+    allWs.delete(ws);
+
     if (!trackId || !cid) return;
 
     const tr = getTrack(trackId);
