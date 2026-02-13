@@ -220,7 +220,12 @@ setInterval(() => {
     cleanupPassive(tr);
 
     const n = tr.players.size;
-    if (!n) continue;
+
+    // Include tracks with zero players so clients can clear stale UI.
+    if (!n) {
+      out[String(trackId)] = { lobby: 0, race: 0, phase: "" };
+      continue;
+    }
 
     const startAt = Number(tr.startAtEpochMs || 0);
     let phase = "lobby";
@@ -467,13 +472,10 @@ wss.on("connection", (ws) => {
     const tr = getTrack(trackId);
 
     tr.ws.delete(cid);
+    tr.players.delete(cid);
 
     // match reset direkt när någon lämnar
     resetMatch(tr, { broadcastStartNull: true });
-
-    // spelare får ligga kvar i players-map tills TTL tar bort dem,
-    // men du kan också ta bort direkt om du vill:
-    // tr.players.delete(cid);
   });
 });
 
