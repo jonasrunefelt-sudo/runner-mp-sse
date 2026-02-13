@@ -1,4 +1,4 @@
-// server.js (WS-only)
+// server.js (WS-only) + presence broadcast
 // Node + Express + ws
 //
 // Env vars:
@@ -40,6 +40,9 @@ function nowMs() {
  */
 const tracks = new Map();
 
+// Health-only sockets that want global track presence (ONLINE track list)
+const presenceSubs = new Set();
+
 function getTrack(trackId) {
   if (!tracks.has(trackId)) {
     tracks.set(trackId, {
@@ -64,7 +67,9 @@ function broadcast(tr, obj) {
   for (const ws of tr.ws.values()) wsSafeSend(ws, obj);
 }
 
-function cleanup(tr) {
+// Removes stale players/ws, but does NOT reset match state.
+// (Used for presence reporting to avoid side-effects.)
+function cleanupPassive(tr) {
   const t = nowMs();
 
   for (const [cid, p] of tr.players.entries()) {
@@ -73,13 +78,15 @@ function cleanup(tr) {
 
       const ws = tr.ws.get(cid);
       if (ws) {
-        try {
-          ws.close();
-        } catch {}
+        try { ws.close(); } catch {}
         tr.ws.delete(cid);
       }
     }
   }
+}
+
+function cleanup(tr) {
+  cleanupPassive(tr);
 
   // Om <2 spelare: nolla matchstate och kräva ny ready
   if (tr.players.size < 2) {
@@ -170,66 +177,6 @@ function startWsBroadcastLoop(trackId) {
 }
 
 /* =========================
-   GLOBAL: Track presence (WS-only, push)
-   - No HTTP endpoints
-   - Sent to ALL connected WS clients (also those not hello-bound)
-========================= */
-
-// All connected sockets (even before hello)
-const allWs = new Set();
-
-let presenceTimer = null;
-const PRESENCE_HZ = 1; // 1 Hz is enough for UI
-const PRESENCE_PERIOD_MS = Math.max(250, Math.round(1000 / PRESENCE_HZ));
-
-function sendGlobalTrackPresence() {
-  const t = nowMs();
-  const out = {};
-
-  for (const [trackId, tr] of tracks.entries()) {
-    // Do a light cleanup for accurate counts
-    cleanup(tr);
-
-    // Count "active" players as those with recent ts
-    let active = 0;
-    for (const p of tr.players.values()) {
-      if (t - (p.ts || 0) <= TTL_MS) active++;
-    }
-
-    if (active <= 0) continue;
-
-    // Simple phase split:
-    // - lobby: no start armed OR countdown not started yet
-    // - race: start time reached (includes ongoing race/finish waiting)
-    let lobby = 0;
-    let race = 0;
-
-    if (!Number.isFinite(tr.startAtEpochMs)) {
-      lobby = active;
-      race = 0;
-    } else if (t < tr.startAtEpochMs) {
-      // countdown phase (treat as lobby; you can show as "COUNTDOWN" client-side if you want)
-      lobby = active;
-      race = 0;
-    } else {
-      lobby = 0;
-      race = active;
-    }
-
-    out[String(trackId)] = { lobby, race };
-  }
-
-  const pkt = { type: "track_presence", serverNowMs: t, tracks: out };
-
-  for (const ws of allWs) wsSafeSend(ws, pkt);
-}
-
-function startGlobalPresenceLoop() {
-  if (presenceTimer) return;
-  presenceTimer = setInterval(sendGlobalTrackPresence, PRESENCE_PERIOD_MS);
-}
-
-/* =========================
    HTTP routes (minimal)
 ========================= */
 app.get("/health", (req, res) => res.status(200).json({ ok: true }));
@@ -253,25 +200,61 @@ function startPingLoop(ws) {
       return;
     }
     if (!ws.isAlive) {
-      try {
-        ws.terminate();
-      } catch {}
+      try { ws.terminate(); } catch {}
       clearInterval(iv);
       return;
     }
     ws.isAlive = false;
-    try {
-      ws.ping();
-    } catch {}
+    try { ws.ping(); } catch {}
   }, 25000);
 }
 
+// Global presence broadcast loop (to healthOnly subscribers)
+setInterval(() => {
+  if (presenceSubs.size === 0) return;
+
+  const t = nowMs();
+  const out = {};
+
+  for (const [trackId, tr] of tracks.entries()) {
+    cleanupPassive(tr);
+
+    const n = tr.players.size;
+    if (!n) continue;
+
+    const startAt = Number(tr.startAtEpochMs || 0);
+    let phase = "lobby";
+    let raceCount = 0;
+
+    if (Number.isFinite(startAt) && startAt > 0) {
+      if (t < startAt) {
+        phase = "countdown";
+        raceCount = 0;
+      } else {
+        phase = "race";
+        for (const p of tr.players.values()) {
+          if (!Number.isFinite(p.finishedAtEpochMs)) raceCount++;
+        }
+      }
+    }
+
+    const lobbyCount = Math.max(0, n - raceCount);
+    out[String(trackId)] = { lobby: lobbyCount, race: raceCount, phase };
+  }
+
+  const pkt = { type: "trackPresence", serverNowMs: t, tracks: out };
+
+  for (const ws of Array.from(presenceSubs)) {
+    if (!ws || ws.readyState !== ws.OPEN) {
+      presenceSubs.delete(ws);
+      continue;
+    }
+    wsSafeSend(ws, pkt);
+  }
+}, 900);
+
 wss.on("connection", (ws) => {
   startPingLoop(ws);
-
-  // ✅ global registry (so ONLINE track list can receive presence without hello)
-  allWs.add(ws);
-  startGlobalPresenceLoop();
 
   // binds after hello
   let trackId = null;
@@ -294,8 +277,17 @@ wss.on("connection", (ws) => {
         const p = tr.players.get(cid);
         if (p) p.ts = nowMs();
       }
-
       wsSafeSend(ws, { type: "pong", serverNowMs: nowMs() });
+      return;
+    }
+
+    // Presence subscribe/unsubscribe (health-only)
+    if (msg.type === "presence_sub") {
+      const on = !!msg.on;
+      if (on) presenceSubs.add(ws);
+      else presenceSubs.delete(ws);
+      // immediate ack snapshot (optional)
+      wsSafeSend(ws, { type: "presenceAck", on, serverNowMs: nowMs() });
       return;
     }
 
@@ -342,7 +334,7 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    // must hello first
+    // must hello first for track-bound messages
     if (!trackId || !cid) return;
 
     const tr = getTrack(trackId);
@@ -465,19 +457,10 @@ wss.on("connection", (ws) => {
       broadcast(tr, payload);
       return;
     }
-
-    // (valfritt) PING: {type:"ping"} -> time sync + heartbeat
-    if (msg.type === "ping") {
-      const p = tr.players.get(cid);
-      if (p) p.ts = nowMs();
-      wsSafeSend(ws, { type: "pong", serverNowMs: nowMs() });
-      return;
-    }
   });
 
   ws.on("close", () => {
-    // ✅ remove from global
-    allWs.delete(ws);
+    presenceSubs.delete(ws);
 
     if (!trackId || !cid) return;
 
