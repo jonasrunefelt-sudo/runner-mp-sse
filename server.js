@@ -483,13 +483,7 @@ wss.on("connection", (ws) => {
         broadcast(tr, payload);
       }
 
-      // NON-timeout: decide immediately (first fail loses)
-      if (!isTimeout) {
-        decide(oppCid, cid);
-        return;
-      }
-
-      // TIMEOUT: record score and wait briefly for opponent's timeout to arrive
+      // TIMEOUT: record score and wait briefly for opponent's fail to arrive
       if (!tr.enduroTimeoutScores) tr.enduroTimeoutScores = new Map();
       if (Number.isFinite(score)) {
         tr.enduroTimeoutScores.set(String(cid), score);
@@ -519,7 +513,7 @@ wss.on("connection", (ws) => {
           return;
         }
 
-        // If score missing: fallback to original behavior (first timeout loses)
+        // If score missing: fallback to original behavior (first fail loses)
         decide(oppCid, cid);
         return;
       }
@@ -530,7 +524,7 @@ wss.on("connection", (ws) => {
           tr.enduroTimeoutTimer = null;
           if (tr.winnerCid) return;
 
-          // Opponent did NOT send timeout within window -> original behavior: first timeout loses
+          // Opponent did NOT send timeout within window -> original behavior: first fail loses
           decide(oppCid, cid);
         }, WINDOW_MS);
       }
