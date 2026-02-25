@@ -409,7 +409,63 @@ wss.on("connection", (ws) => {
 
       return;
     }
+    // ENDURO FAIL: {type:"enduroFail", reason, trackId}
+    // The sender LOST. Winner is the other player. Broadcast a normal "finish" packet.
+    if (msg.type === "enduroFail") {
+      if (!tr.players.has(cid)) {
+        tr.players.set(cid, {
+          x: null,
+          y: null,
+          vx: 0,
+          vy: 0,
+          ts: nowMs(),
+          ready: false,
+          finishedAtEpochMs: null,
+          finish: null,
+        });
+      }
 
+      const p = tr.players.get(cid);
+      p.ts = nowMs();
+
+      // If a winner is already decided, ignore duplicates.
+      if (tr.winnerCid) return;
+
+      // Find opponent (the one who did NOT send this packet)
+      let oppCid = null;
+      for (const otherCid of tr.players.keys()) {
+        if (String(otherCid) !== String(cid)) { oppCid = String(otherCid); break; }
+      }
+
+      // If no opponent, cannot decide winner.
+      if (!oppCid) return;
+
+      tr.winnerCid = oppCid;
+
+      // Mark loser as "finished" so clients can snap/enter end-flow consistently.
+      if (!Number.isFinite(p.finishedAtEpochMs)) p.finishedAtEpochMs = nowMs();
+
+      // Use last known position as a "finish" snap (client B doesn't send x/y for enduroFail).
+      p.finish = {
+        x: Number.isFinite(p.x) ? p.x : 0,
+        y: Number.isFinite(p.y) ? p.y : 0,
+        runMs: null,
+        serverNowMs: nowMs(),
+      };
+
+      const payload = {
+        type: "finish",
+        cid, // the loser (same structure as your normal finish broadcast)
+        finishedAtEpochMs: p.finishedAtEpochMs,
+        winnerCid: tr.winnerCid,
+        serverNowMs: nowMs(),
+        finish: p.finish,
+        enduroReason: String(msg.reason || ""), // optional debug/info
+      };
+
+      broadcast(tr, payload);
+      return;
+    }
     // FINISH: {type:"finish", x, y, runMs}
     if (msg.type === "finish") {
       if (!tr.players.has(cid)) {
