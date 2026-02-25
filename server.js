@@ -51,6 +51,10 @@ function getTrack(trackId) {
       winnerCid: null,
       ws: new Map(),
       _broadcastTimer: null,
+    
+      // ENDURO timeout tie-break
+      enduroTimeoutScores: new Map(), // cid -> score (number)
+      enduroTimeoutTimer: null,       // timeout handle
     });
   }
   return tracks.get(trackId);
@@ -97,7 +101,14 @@ function cleanup(tr) {
 function resetMatch(tr, { broadcastStartNull } = { broadcastStartNull: false }) {
   tr.startAtEpochMs = null;
   tr.winnerCid = null;
-
+  
+  // ENDURO timeout tie-break cleanup
+  if (tr.enduroTimeoutTimer) {
+    try { clearTimeout(tr.enduroTimeoutTimer); } catch {}
+    tr.enduroTimeoutTimer = null;
+  }
+  if (tr.enduroTimeoutScores) tr.enduroTimeoutScores.clear();
+  
   for (const p of tr.players.values()) {
     p.ready = false;
     p.finishedAtEpochMs = null;
@@ -411,6 +422,8 @@ wss.on("connection", (ws) => {
     }
     // ENDURO FAIL: {type:"enduroFail", reason, trackId}
     // The sender LOST. Winner is the other player. Broadcast a normal "finish" packet.
+    // ENDURO FAIL: {type:"enduroFail", reason, trackId, score}
+    // The sender LOST. For timeout-on-same-lap, compare score (decimal laps).
     if (msg.type === "enduroFail") {
       if (!tr.players.has(cid)) {
         tr.players.set(cid, {
@@ -428,42 +441,100 @@ wss.on("connection", (ws) => {
       const p = tr.players.get(cid);
       p.ts = nowMs();
 
-      // If a winner is already decided, ignore duplicates.
+      // If a winner is already decided, ignore.
       if (tr.winnerCid) return;
 
-      // Find opponent (the one who did NOT send this packet)
+      // Find opponent
       let oppCid = null;
       for (const otherCid of tr.players.keys()) {
         if (String(otherCid) !== String(cid)) { oppCid = String(otherCid); break; }
       }
-
-      // If no opponent, cannot decide winner.
       if (!oppCid) return;
 
-      tr.winnerCid = oppCid;
+      const reason = String(msg.reason || "");
+      const score = Number(msg.score);
+      const isTimeout = /too\s*slow|timeout/i.test(reason);
 
-      // Mark loser as "finished" so clients can snap/enter end-flow consistently.
-      if (!Number.isFinite(p.finishedAtEpochMs)) p.finishedAtEpochMs = nowMs();
+      // Helper: finalize winner and broadcast normal finish packet
+      function decide(winnerCid, loserCid) {
+        if (tr.winnerCid) return;
+        tr.winnerCid = String(winnerCid);
 
-      // Use last known position as a "finish" snap (client B doesn't send x/y for enduroFail).
-      p.finish = {
-        x: Number.isFinite(p.x) ? p.x : 0,
-        y: Number.isFinite(p.y) ? p.y : 0,
-        runMs: null,
-        serverNowMs: nowMs(),
-      };
+        const lp = tr.players.get(String(loserCid));
+        if (lp) {
+          if (!Number.isFinite(lp.finishedAtEpochMs)) lp.finishedAtEpochMs = nowMs();
+          lp.finish = {
+            x: Number.isFinite(lp.x) ? lp.x : 0,
+            y: Number.isFinite(lp.y) ? lp.y : 0,
+            runMs: null,
+            serverNowMs: nowMs(),
+          };
+        }
 
-      const payload = {
-        type: "finish",
-        cid, // the loser (same structure as your normal finish broadcast)
-        finishedAtEpochMs: p.finishedAtEpochMs,
-        winnerCid: tr.winnerCid,
-        serverNowMs: nowMs(),
-        finish: p.finish,
-        enduroReason: String(msg.reason || ""), // optional debug/info
-      };
+        const payload = {
+          type: "finish",
+          cid: String(loserCid), // loser (same convention as your normal finish broadcast)
+          finishedAtEpochMs: (lp && lp.finishedAtEpochMs) ? lp.finishedAtEpochMs : nowMs(),
+          winnerCid: tr.winnerCid,
+          serverNowMs: nowMs(),
+          finish: (lp && lp.finish) ? lp.finish : { x: 0, y: 0, runMs: null, serverNowMs: nowMs() },
+        };
 
-      broadcast(tr, payload);
+        broadcast(tr, payload);
+      }
+
+      // NON-timeout: decide immediately (first fail loses)
+      if (!isTimeout) {
+        decide(oppCid, cid);
+        return;
+      }
+
+      // TIMEOUT: record score and wait briefly for opponent's timeout to arrive
+      if (!tr.enduroTimeoutScores) tr.enduroTimeoutScores = new Map();
+      if (Number.isFinite(score)) {
+        tr.enduroTimeoutScores.set(String(cid), score);
+      } else {
+        tr.enduroTimeoutScores.set(String(cid), null);
+      }
+
+      const WINDOW_MS = 250;
+
+      // If opponent already timed out, decide now by score
+      if (tr.enduroTimeoutScores.has(String(oppCid))) {
+        const sA = tr.enduroTimeoutScores.get(String(cid));
+        const sB = tr.enduroTimeoutScores.get(String(oppCid));
+
+        if (Number.isFinite(sA) && Number.isFinite(sB)) {
+          if (sA === sB) {
+            // exact tie: deterministic fallback
+            const winner = (String(cid) < String(oppCid)) ? cid : oppCid;
+            const loser = (winner === String(cid)) ? oppCid : cid;
+            decide(winner, loser);
+            return;
+          }
+
+          const winner = (sA > sB) ? cid : oppCid;
+          const loser = (winner === String(cid)) ? oppCid : cid;
+          decide(winner, loser);
+          return;
+        }
+
+        // If score missing: fallback to original behavior (first timeout loses)
+        decide(oppCid, cid);
+        return;
+      }
+
+      // Arm one-shot timer if not already armed
+      if (!tr.enduroTimeoutTimer) {
+        tr.enduroTimeoutTimer = setTimeout(() => {
+          tr.enduroTimeoutTimer = null;
+          if (tr.winnerCid) return;
+
+          // Opponent did NOT send timeout within window -> original behavior: first timeout loses
+          decide(oppCid, cid);
+        }, WINDOW_MS);
+      }
+
       return;
     }
     // FINISH: {type:"finish", x, y, runMs}
