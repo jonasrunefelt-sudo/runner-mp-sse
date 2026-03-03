@@ -6,6 +6,8 @@
 // - TTL_MS (default 60000)
 // - SNAPSHOT_HZ (default 30)
 // - START_DELAY_MS (default 3500)
+// - STATS_URL (e.g. https://your-stats-service.koyeb.app)   <-- NEW
+// - STATS_TOKEN (shared secret, same as stats SERVICE_TOKEN) <-- NEW
 
 import express from "express";
 import cors from "cors";
@@ -21,8 +23,56 @@ const TTL_MS = Number(process.env.TTL_MS || 60000);
 const SNAPSHOT_HZ = Number(process.env.SNAPSHOT_HZ || 60);
 const START_DELAY_MS = Number(process.env.START_DELAY_MS || 3500);
 
+// NEW: stats-service integration (async, fire-and-forget)
+const STATS_URL = String(process.env.STATS_URL || "");
+const STATS_TOKEN = String(process.env.STATS_TOKEN || "");
+
 function nowMs() {
   return Date.now();
+}
+
+function postToStats(path, payload) {
+  if (!STATS_URL) return;
+  const url = STATS_URL.replace(/\/+$/, "") + path;
+
+  try {
+    // Node 18+ has global fetch on most platforms (Koyeb typically uses modern Node)
+    fetch(url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...(STATS_TOKEN ? { "x-service-token": STATS_TOKEN } : {}),
+      },
+      body: JSON.stringify(payload),
+    }).catch(() => {});
+  } catch {}
+}
+
+function tryReportMatchFinished(tr, trackId, winnerCid, loserCid, reason) {
+  // Never block gameplay: async and best-effort only
+  if (!trackId || !winnerCid || !loserCid) return;
+  if (tr.reportedMatch) return; // prevent double-report
+  if (String(winnerCid) === String(loserCid)) return;
+
+  const wp = tr.players.get(String(winnerCid));
+  const lp = tr.players.get(String(loserCid));
+
+  const winnerPlayerId = wp?.playerId ? String(wp.playerId) : "";
+  const loserPlayerId = lp?.playerId ? String(lp.playerId) : "";
+
+  // If clients haven't provided playerId yet, do nothing (safe)
+  if (!winnerPlayerId || !loserPlayerId) return;
+
+  tr.reportedMatch = true;
+
+  postToStats("/event/matchFinished", {
+    trackId: String(trackId),
+    winnerPlayerId,
+    loserPlayerId,
+    reason: String(reason || "finish"),
+    deviceHintWinner: wp?.deviceHint != null ? String(wp.deviceHint) : null,
+    deviceHintLoser: lp?.deviceHint != null ? String(lp.deviceHint) : null,
+  });
 }
 
 /**
@@ -30,7 +80,8 @@ function nowMs() {
  *   players: Map(cid -> {
  *     x,y,vx,vy, ts, ready,
  *     finishedAtEpochMs: number|null,
- *     finish: { x:number, y:number, runMs:number|null, serverNowMs:number } | null
+ *     finish: { x:number, y:number, runMs:number|null, serverNowMs:number } | null,
+ *     playerId?: string|null, nickname?: string|null, deviceHint?: string|null
  *   }),
  *   startAtEpochMs: number|null,
  *   winnerCid: string|null,
@@ -51,10 +102,13 @@ function getTrack(trackId) {
       winnerCid: null,
       ws: new Map(),
       _broadcastTimer: null,
-    
+
       // ENDURO timeout tie-break
       enduroTimeoutScores: new Map(), // cid -> score (number)
-      enduroTimeoutTimer: null,       // timeout handle
+      enduroTimeoutTimer: null, // timeout handle
+
+      // NEW: prevent duplicate stats reporting per match
+      reportedMatch: false,
     });
   }
   return tracks.get(trackId);
@@ -82,7 +136,9 @@ function cleanupPassive(tr) {
 
       const ws = tr.ws.get(cid);
       if (ws) {
-        try { ws.close(); } catch {}
+        try {
+          ws.close();
+        } catch {}
         tr.ws.delete(cid);
       }
     }
@@ -101,14 +157,19 @@ function cleanup(tr) {
 function resetMatch(tr, { broadcastStartNull } = { broadcastStartNull: false }) {
   tr.startAtEpochMs = null;
   tr.winnerCid = null;
-  
+
+  // NEW: allow reporting again next match
+  tr.reportedMatch = false;
+
   // ENDURO timeout tie-break cleanup
   if (tr.enduroTimeoutTimer) {
-    try { clearTimeout(tr.enduroTimeoutTimer); } catch {}
+    try {
+      clearTimeout(tr.enduroTimeoutTimer);
+    } catch {}
     tr.enduroTimeoutTimer = null;
   }
   if (tr.enduroTimeoutScores) tr.enduroTimeoutScores.clear();
-  
+
   for (const p of tr.players.values()) {
     p.ready = false;
     p.finishedAtEpochMs = null;
@@ -211,12 +272,16 @@ function startPingLoop(ws) {
       return;
     }
     if (!ws.isAlive) {
-      try { ws.terminate(); } catch {}
+      try {
+        ws.terminate();
+      } catch {}
       clearInterval(iv);
       return;
     }
     ws.isAlive = false;
-    try { ws.ping(); } catch {}
+    try {
+      ws.ping();
+    } catch {}
   }, 25000);
 }
 
@@ -307,7 +372,7 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    // HELLO: {type:"hello", track, cid}
+    // HELLO: {type:"hello", track, cid, playerId?, nickname?, deviceHint?}
     if (msg.type === "hello") {
       trackId = String(msg.track || "track-000");
       cid = String(msg.cid || "");
@@ -320,6 +385,10 @@ wss.on("connection", (ws) => {
       tr.ws.set(cid, ws);
       startWsBroadcastLoop(trackId);
 
+      const incomingPlayerId = msg.playerId != null ? String(msg.playerId) : null;
+      const incomingNickname = msg.nickname != null ? String(msg.nickname) : null;
+      const incomingDeviceHint = msg.deviceHint != null ? String(msg.deviceHint) : null;
+
       // register player if not exists
       if (!tr.players.has(cid)) {
         tr.players.set(cid, {
@@ -331,9 +400,19 @@ wss.on("connection", (ws) => {
           ready: false,
           finishedAtEpochMs: null,
           finish: null,
+
+          // NEW identity fields (optional)
+          playerId: incomingPlayerId,
+          nickname: incomingNickname,
+          deviceHint: incomingDeviceHint,
         });
       } else {
-        tr.players.get(cid).ts = nowMs();
+        const p = tr.players.get(cid);
+        p.ts = nowMs();
+        // Update identity fields if provided
+        if (incomingPlayerId) p.playerId = incomingPlayerId;
+        if (incomingNickname) p.nickname = incomingNickname;
+        if (incomingDeviceHint) p.deviceHint = incomingDeviceHint;
       }
 
       // state ack
@@ -420,8 +499,7 @@ wss.on("connection", (ws) => {
 
       return;
     }
-    // ENDURO FAIL: {type:"enduroFail", reason, trackId}
-    // The sender LOST. Winner is the other player. Broadcast a normal "finish" packet.
+
     // ENDURO FAIL: {type:"enduroFail", reason, trackId, score}
     // The sender LOST. For timeout-on-same-lap, compare score (decimal laps).
     if (msg.type === "enduroFail") {
@@ -447,13 +525,15 @@ wss.on("connection", (ws) => {
       // Find opponent
       let oppCid = null;
       for (const otherCid of tr.players.keys()) {
-        if (String(otherCid) !== String(cid)) { oppCid = String(otherCid); break; }
+        if (String(otherCid) !== String(cid)) {
+          oppCid = String(otherCid);
+          break;
+        }
       }
       if (!oppCid) return;
 
       const reason = String(msg.reason || "");
       const score = Number(msg.score);
-      const isTimeout = /too\s*slow|timeout/i.test(reason);
 
       // Helper: finalize winner and broadcast normal finish packet
       function decide(winnerCid, loserCid) {
@@ -474,16 +554,18 @@ wss.on("connection", (ws) => {
         const payload = {
           type: "finish",
           cid: String(loserCid), // loser (same convention as your normal finish broadcast)
-          finishedAtEpochMs: (lp && lp.finishedAtEpochMs) ? lp.finishedAtEpochMs : nowMs(),
+          finishedAtEpochMs: lp && lp.finishedAtEpochMs ? lp.finishedAtEpochMs : nowMs(),
           winnerCid: tr.winnerCid,
           serverNowMs: nowMs(),
-          finish: (lp && lp.finish) ? lp.finish : { x: 0, y: 0, runMs: null, serverNowMs: nowMs() },
+          finish: lp && lp.finish ? lp.finish : { x: 0, y: 0, runMs: null, serverNowMs: nowMs() },
         };
 
         broadcast(tr, payload);
+
+        // NEW: report ONLINE match async (best effort)
+        tryReportMatchFinished(tr, trackId, String(winnerCid), String(loserCid), reason || "enduroFail");
       }
 
-      // TIMEOUT: record score and wait briefly for opponent's fail to arrive
       if (!tr.enduroTimeoutScores) tr.enduroTimeoutScores = new Map();
       if (Number.isFinite(score)) {
         tr.enduroTimeoutScores.set(String(cid), score);
@@ -501,14 +583,14 @@ wss.on("connection", (ws) => {
         if (Number.isFinite(sA) && Number.isFinite(sB)) {
           if (sA === sB) {
             // exact tie: deterministic fallback
-            const winner = (String(cid) < String(oppCid)) ? cid : oppCid;
-            const loser = (winner === String(cid)) ? oppCid : cid;
+            const winner = String(cid) < String(oppCid) ? cid : oppCid;
+            const loser = winner === String(cid) ? oppCid : cid;
             decide(winner, loser);
             return;
           }
 
-          const winner = (sA > sB) ? cid : oppCid;
-          const loser = (winner === String(cid)) ? oppCid : cid;
+          const winner = sA > sB ? cid : oppCid;
+          const loser = winner === String(cid) ? oppCid : cid;
           decide(winner, loser);
           return;
         }
@@ -531,6 +613,7 @@ wss.on("connection", (ws) => {
 
       return;
     }
+
     // FINISH: {type:"finish", x, y, runMs}
     if (msg.type === "finish") {
       if (!tr.players.has(cid)) {
@@ -562,8 +645,8 @@ wss.on("connection", (ws) => {
 
       // Spara finish-payload för exakt “snap”
       p.finish = {
-        x: Number.isFinite(fx) ? fx : (Number.isFinite(p.x) ? p.x : 0),
-        y: Number.isFinite(fy) ? fy : (Number.isFinite(p.y) ? p.y : 0),
+        x: Number.isFinite(fx) ? fx : Number.isFinite(p.x) ? p.x : 0,
+        y: Number.isFinite(fy) ? fy : Number.isFinite(p.y) ? p.y : 0,
         runMs: Number.isFinite(frun) ? frun : null,
         serverNowMs: nowMs(),
       };
@@ -581,6 +664,15 @@ wss.on("connection", (ws) => {
       };
 
       broadcast(tr, payload);
+
+      // NEW: report ONLINE match async (best effort)
+      // If this finisher is the winner (first finisher), loser is the other cid (only meaningful for 2p matches).
+      if (String(tr.winnerCid) === String(cid) && tr.players.size === 2) {
+        const cids = Array.from(tr.players.keys()).map(String);
+        const loserCid = cids[0] === String(cid) ? cids[1] : cids[0];
+        tryReportMatchFinished(tr, trackId, String(cid), String(loserCid), "finish");
+      }
+
       return;
     }
   });
