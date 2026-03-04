@@ -220,8 +220,14 @@ function startWsBroadcastLoop(trackId) {
       const vx = Number.isFinite(p.vx) ? p.vx : 0;
       const vy = Number.isFinite(p.vy) ? p.vy : 0;
 
+      // NEW: include identity fields (null if missing)
+      const playerId = p.playerId != null && String(p.playerId) ? String(p.playerId) : null;
+      const nickname = p.nickname != null && String(p.nickname) ? String(p.nickname) : null;
+
       players.push({
         cid,
+        playerId,
+        nickname,
         x,
         y,
         vx,
@@ -247,7 +253,6 @@ function startWsBroadcastLoop(trackId) {
     broadcast(tr, pkt);
   }, period);
 }
-
 /* =========================
    HTTP routes (minimal)
 ========================= */
