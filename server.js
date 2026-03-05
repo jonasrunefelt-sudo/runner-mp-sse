@@ -684,14 +684,41 @@ wss.on("connection", (ws) => {
 
   ws.on("close", () => {
     presenceSubs.delete(ws);
-
+  
     if (!trackId || !cid) return;
-
+  
     const tr = getTrack(trackId);
-
+  
+    // NEW: If a player leaves AFTER the race has started and no winner is decided yet,
+    // count it as a loss for the leaver and a win for the remaining player (best-effort).
+    try {
+      const t = nowMs();
+      const startAt = Number(tr.startAtEpochMs || 0);
+      const raceStarted = Number.isFinite(startAt) && startAt > 0 && t >= startAt;
+  
+      // Only handle 2-player races, and only if we haven't already reported the match.
+      if (!tr.reportedMatch && raceStarted && !tr.winnerCid && tr.players.size === 2) {
+        let otherCid = null;
+        for (const other of tr.players.keys()) {
+          if (String(other) !== String(cid)) {
+            otherCid = String(other);
+            break;
+          }
+        }
+  
+        if (otherCid) {
+          // Mark a winner (temporary; resetMatch will clear it immediately)
+          tr.winnerCid = otherCid;
+  
+          // Report to stats-server (requires both playerIds to be known)
+          tryReportMatchFinished(tr, trackId, otherCid, String(cid), "disconnect");
+        }
+      }
+    } catch {}
+  
     tr.ws.delete(cid);
     tr.players.delete(cid);
-
+  
     // match reset direkt när någon lämnar
     resetMatch(tr, { broadcastStartNull: true });
   });
