@@ -718,7 +718,8 @@ ws.on("close", () => {
   // match reset direkt när någon lämnar
   resetMatch(tr, { broadcastStartNull: true });
 });
-  
+});
+
 /* =========================
    Start server
 ========================= */
