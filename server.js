@@ -32,11 +32,14 @@ function nowMs() {
 }
 
 function postToStats(path, payload) {
-  if (!STATS_URL) return;
+  if (!STATS_URL) {
+    console.log("[stats] STATS_URL missing, skipping", path);
+    return;
+  }
+
   const url = STATS_URL.replace(/\/+$/, "") + path;
 
   try {
-    // Node 18+ has global fetch on most platforms (Koyeb typically uses modern Node)
     fetch(url, {
       method: "POST",
       headers: {
@@ -44,15 +47,42 @@ function postToStats(path, payload) {
         ...(STATS_TOKEN ? { "x-service-token": STATS_TOKEN } : {}),
       },
       body: JSON.stringify(payload),
-    }).catch(() => {});
-  } catch {}
+    })
+      .then(async (res) => {
+        const txt = await res.text().catch(() => "");
+        console.log("[stats] POST", path, "status=", res.status, "ok=", res.ok, "body=", txt.slice(0, 300));
+      })
+      .catch((e) => {
+        console.log("[stats] POST failed", path, e?.message || e);
+      });
+  } catch (e) {
+    console.log("[stats] POST threw", path, e?.message || e);
+  }
 }
-
 function tryReportMatchFinished(tr, trackId, winnerCid, loserCid, reason) {
+  console.log("[match] tryReportMatchFinished called", {
+    trackId,
+    winnerCid,
+    loserCid,
+    reason,
+    reportedMatch: !!tr.reportedMatch,
+  });
+
   // Never block gameplay: async and best-effort only
-  if (!trackId || !winnerCid || !loserCid) return;
-  if (tr.reportedMatch) return; // prevent double-report
-  if (String(winnerCid) === String(loserCid)) return;
+  if (!trackId || !winnerCid || !loserCid) {
+    console.log("[match] abort: missing ids", { trackId, winnerCid, loserCid });
+    return;
+  }
+
+  if (tr.reportedMatch) {
+    console.log("[match] abort: already reported");
+    return;
+  }
+
+  if (String(winnerCid) === String(loserCid)) {
+    console.log("[match] abort: winner === loser");
+    return;
+  }
 
   const wp = tr.players.get(String(winnerCid));
   const lp = tr.players.get(String(loserCid));
@@ -60,8 +90,23 @@ function tryReportMatchFinished(tr, trackId, winnerCid, loserCid, reason) {
   const winnerPlayerId = wp?.playerId ? String(wp.playerId) : "";
   const loserPlayerId = lp?.playerId ? String(lp.playerId) : "";
 
+  console.log("[match] resolved players", {
+    winnerCid,
+    loserCid,
+    winnerPlayerId,
+    loserPlayerId,
+    winnerNickname: wp?.nickname || null,
+    loserNickname: lp?.nickname || null,
+  });
+
   // If clients haven't provided playerId yet, do nothing (safe)
-  if (!winnerPlayerId || !loserPlayerId) return;
+  if (!winnerPlayerId || !loserPlayerId) {
+    console.log("[match] abort: missing playerId", {
+      winnerPlayerId,
+      loserPlayerId,
+    });
+    return;
+  }
 
   tr.reportedMatch = true;
 
@@ -74,7 +119,6 @@ function tryReportMatchFinished(tr, trackId, winnerCid, loserCid, reason) {
     deviceHintLoser: lp?.deviceHint != null ? String(lp.deviceHint) : null,
   });
 }
-
 /**
  * tracks[trackId] = {
  *   players: Map(cid -> {
